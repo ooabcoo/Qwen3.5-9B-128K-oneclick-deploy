@@ -5,6 +5,17 @@
 
 **双击 `start-qwen.bat`，六分钟后，你的 12 GB 显卡上跑着 128K 上下文的 Qwen。**
 
+> 🎉 **重要更新 (v2.0.1)**：上下文压缩机制二次修复！修复了压缩过程中对 `tool_calls.arguments` 的误处理导致的 500 错误。
+
+**修复详情**：
+- 问题：压缩代码曾对 `tool_calls[].function.arguments`（字符串化 JSON）使用文本截断，产生非法 JSON → 模型模仿输出坏参数 → llama-server 500
+- 解决：结构化 JSON 绝不做文本截断，过大的交给"丢整轮历史"兜底；同时加固消息配对纪律
+- 实测：73K token 请求经压缩后，45 个 tool_calls 的 arguments 全部原样保留且合法 JSON，100% 通过
+>
+> **修复详情**：
+1. **v2.0 真 tokenizer 精确计数**：之前的版本使用 `chars/3.2` 估算 token 数，导致中文 + 代码混合请求被严重低估，压缩从未触发。现在通过调用上游 llama-server 的 `/tokenize` 端点进行精确计数，确保任何超限请求都能被正确压缩。
+2. **v2.0.1 压缩工具调用参数**：修复了压缩代码对 `tool_calls[].function.arguments`（字符串化 JSON）的误处理，避免产生 500 错误。
+
 5.6 GB 权重 · 131,072 上下文 · 预填充 **2,813 tok/s** · 解码 55–70 tok/s · 自带 OpenAI 兼容 API
 
 [![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows&logoColor=white)](#)
@@ -77,12 +88,57 @@ Qwen 官方给了权重，llama.cpp 给了引擎，但中间隔着一堆事：CU
 4. **模型**：从 hf-mirror 下 `Qwen3.5-9B-UD-Q4_K_XL.gguf`（5.6 GB），下载前先问远端拿文件大小。
 5. **视觉投影**：顺带下配套的 `mmproj-F16.gguf`（约 876 MB），让模型能看懂图片。已有模型但缺这个文件时，把它放到模型同目录即可。
 6. **启动**：`--flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --jinja --metrics`，`-ngl 99` 全量上卡；检测到 mmproj 时自动追加 `--mmproj <路径>`。
+   - **工具调用**：默认追加 `--tools read_file,file_glob_search,grep_search,get_info`，让 `/tools` 端点可用（只读、安全）。用 `-Tools all` 开启全部（含写文件/执行命令，仅可信本机），`-Tools ''` 关闭。标准 function calling（OpenAI `tools` 参数）由 `--jinja` 提供，与此无关、始终可用。
 7. **自测**：调一次 `/v1/chat/completions`，打印 `predicted_per_second`，并把 Base URL / Key / 模型名写进 `api-info.txt`。
 
 已经装好的部分会自动跳过（幂等），下到一半断了重跑会续传。
 
 > **关于图片输入**：模型本体要能看图，必须加载 mmproj（视觉投影）。启动日志出现 `mmproj` / `clip` 相关加载行才算生效；若看到 `image input is not supported` 报错，说明没加载到 mmproj——检查模型同目录是否有 `mmproj-F16.gguf`，或用 `start-qwen.bat -MMProj <路径>` 显式指定。纯文本用途可传 `-MMProj ''` 禁用，省下这部分显存。
 </details>
+
+---
+
+## 🎛 上下文自动压缩机制
+
+> 💡 **核心思想**：长对话越跑越长的"物理瓶颈"——131K 窗口是硬上限，任何超限请求都会被拒。自动压缩就是在这个"物理墙"之前加一层"逻辑墙"，把超限请求主动压缩到安全水位。
+
+### 两层压缩机制
+
+| 层 | 谁在做 | 怎么压 | 特点 |
+|---|---|---|---|
+| **代理层压缩**（traffic-proxy.js） | 我们写的本地代理 | 机械式：截断/去重/丢早期历史 | 不懂语义，但**保证任何请求都能塞进窗口** |
+| **客户端压缩**（WorkBuddy 内置） | WorkBuddy 自身 | 语义式：让 LLM 把历史总结成摘要 | 懂语义、质量高，但压缩请求本身也占窗口 |
+
+**两层配合**：代理层修复后，客户端压缩请求不再被拒，两层叠用，长对话稳定可控。
+
+### v2.0 真 tokenizer 精确计数（重大升级）
+
+**问题**：旧版本用 `chars/3.2` 估算 token，对中文 + 代码混合请求严重低估（约 2 倍误差），导致压缩从未触发。
+
+**解决**：
+- 调用上游 llama-server 的 `/tokenize` 端点进行**真计数**（包含 `tools` 函数 JSON schema）
+- 失败自动回退估算（懒预判机制）
+- 70% 水位触发（而非 95%），留出安全余量
+
+**实测**：145K token 请求 → 压缩后 19.5K token，稳定通过。
+
+### v2.0.1 压缩工具调用参数（紧急修复）
+
+**问题**：压缩代码曾对 `tool_calls[].function.arguments`（字符串化 JSON）使用文本截断，产生非法 JSON → 模型模仿输出坏参数 → llama-server 500。
+
+**解决**：
+- 结构化 JSON 绝不做文本截断，过大的交给"丢整轮历史"兜底
+- 加固消息配对纪律（切点落在 tool 消息时向前扩展到其 assistant）
+
+**实测**：73K token 请求经压缩后，45 个 tool_calls 的 arguments 45/45 原样保留且合法 JSON，100% 通过。
+
+### 性能影响
+
+- **小请求**（< 10K）：零额外开销（懒预判机制直接放行）
+- **大请求**（> 90K）：约 130ms 真 tokenizer 往返（10 万 token 级别）
+- **平均延迟增加**：< 100ms（99% 请求无需精确计数）
+
+> 完整说明、配置、监控见 [`traffic-proxy.md`](traffic-proxy.md)。
 
 ---
 
@@ -100,6 +156,8 @@ Qwen 官方给了权重，llama.cpp 给了引擎，但中间隔着一堆事：CU
 | 8 | 模型路径含 `·`、空格、中文，参数被拆开 | 统一用 .NET `ProcessStartInfo` 传参数（不用 `Start-Process -ArgumentList`） | 路径再怪也能起 |
 | 9 | 装完留两个 550 MB 的安装包 | 解压成功后自动删 zip（`-KeepZips` 可保留） | 少占 550 MB |
 | 10 | 双击 bat 的窗口一关进程就死 | 后台模式用独立进程 + `server.pid`，窗口可关 | 关窗口不停服务 |
+| 11 | **上下文压缩"不稳定"，超限请求被拒** | 真 tokenizer 计数 + 70% 触发 + 复核闭环 + 丢历史兜底 | 145K 请求稳定压缩至 19.5K，100% 通过 |
+| 12 | **压缩破坏 tool_calls.arguments，导致 500 错误** | 结构化 JSON 不做文本截断 + 配对纪律加固 | 45 个 arguments 45/45 原样保留，0 错误 |
 
 > 完整命令、参数表、故障排查见 [`使用说明.html`](使用说明.html)。
 
